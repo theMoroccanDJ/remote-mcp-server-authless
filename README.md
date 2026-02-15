@@ -8,6 +8,7 @@ This Worker is an **OAuth-protected remote MCP server** for YNAB on Cloudflare W
 - GitHub OAuth App Homepage URL: `https://remote-mcp-server-authless.dj8gbxbrpp.workers.dev/`
 - GitHub OAuth Callback URL: `https://remote-mcp-server-authless.dj8gbxbrpp.workers.dev/callback`
 - ChatGPT MCP Server URL: `https://remote-mcp-server-authless.dj8gbxbrpp.workers.dev/mcp`
+- OAuth Protected Resource Metadata URL: `https://remote-mcp-server-authless.dj8gbxbrpp.workers.dev/.well-known/oauth-protected-resource`
 
 ## MCP transport URL
 
@@ -55,7 +56,6 @@ npm run deploy
 
 ## Smoke test checklist
 
-1. `GET /health` shows `mcp: "/mcp"`.
-2. Visiting `/authorize` redirects to GitHub (after consent step).
-3. GitHub redirects back to `/callback` and authorization completes.
-4. After auth, ChatGPT can call `ynab_list_budgets` over `/mcp`.
+1. `GET /.well-known/oauth-protected-resource` returns the expected JSON metadata.
+2. `GET /authorize` (and consent submit) redirects to GitHub.
+3. OAuth completes and `/mcp` works in an authenticated client (e.g., `ynab_list_budgets`).

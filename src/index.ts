@@ -168,7 +168,7 @@ export class MyMCP extends McpAgent<EnvWithConfig, Props> {
 	}
 }
 
-export default new OAuthProvider({
+const oauthProvider = new OAuthProvider({
 	apiHandler: MyMCP.serve("/mcp") as never,
 	apiRoute: "/mcp",
 	authorizeEndpoint: "/authorize",
@@ -176,3 +176,45 @@ export default new OAuthProvider({
 	defaultHandler: GitHubHandler,
 	tokenEndpoint: "/token",
 });
+
+const getBaseUrl = (request: Request) => {
+	const url = new URL(request.url);
+	return `${url.protocol}//${url.host}`;
+};
+
+const getProtectedResourceMetadata = (request: Request) => {
+	const resource = getBaseUrl(request);
+	return {
+		resource,
+		authorization_servers: [resource],
+		scopes_supported: ["ynab:read"],
+		resource_documentation: "https://github.com/theMoroccanDJ/remote-mcp-server-authless",
+	};
+};
+
+export default {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+		const url = new URL(request.url);
+
+		if (url.pathname === "/.well-known/oauth-protected-resource" && request.method === "GET") {
+			return Response.json(getProtectedResourceMetadata(request));
+		}
+
+		const response = await oauthProvider.fetch(request, env, ctx);
+
+		if (url.pathname === "/mcp" && response.status === 401) {
+			const headers = new Headers(response.headers);
+			headers.set(
+				"WWW-Authenticate",
+				`Bearer realm="mcp", resource_metadata="${getBaseUrl(request)}/.well-known/oauth-protected-resource"`,
+			);
+			return new Response(response.body, {
+				status: response.status,
+				statusText: response.statusText,
+				headers,
+			});
+		}
+
+		return response;
+	},
+};
