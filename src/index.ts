@@ -1,4 +1,4 @@
-import OAuthProvider from "@cloudflare/workers-oauth-provider";
+import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpAgent } from "agents/mcp";
 import { z } from "zod";
@@ -29,7 +29,11 @@ export class MyMCP extends McpAgent<EnvWithConfig, Props> {
 		const allowedUsername = this.env.ALLOWED_GITHUB_USERNAME?.trim().toLowerCase();
 		const login = this.props?.login?.trim().toLowerCase();
 
-		if (!login || !allowedUsername || login !== allowedUsername) {
+		if (!allowedUsername) {
+			throw new Error("Missing ALLOWED_GITHUB_USERNAME Cloudflare secret.");
+		}
+
+		if (!login || login !== allowedUsername) {
 			this.server.tool(
 				"whoami",
 				"Shows the authenticated GitHub username and current allowlist status.",
