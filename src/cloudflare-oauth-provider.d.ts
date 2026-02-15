@@ -1,5 +1,5 @@
 declare module "@cloudflare/workers-oauth-provider" {
-	const OAuthProvider: new (options: {
+	export const OAuthProvider: new (options: {
 		apiHandler: unknown;
 		apiRoute: string;
 		authorizeEndpoint: string;
@@ -7,6 +7,4 @@ declare module "@cloudflare/workers-oauth-provider" {
 		defaultHandler: unknown;
 		tokenEndpoint: string;
 	}) => ExportedHandler<Env>;
-
-	export default OAuthProvider;
 }
