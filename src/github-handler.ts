@@ -23,6 +23,26 @@ type PendingAuthorization = {
 	createdAt: number;
 };
 
+type OAuthProviderBinding = {
+	parseAuthRequest: (request: Request) => Promise<unknown>;
+	completeAuthorization: (params: {
+		request: Request;
+		userId: string;
+		scope?: string;
+		clientId?: string;
+		redirectUri?: string;
+		state?: string;
+		codeChallenge?: string;
+		codeChallengeMethod?: string;
+		nonce?: string;
+		props?: Record<string, unknown>;
+	}) => Promise<Response>;
+};
+
+type EnvWithOAuthProvider = Env & {
+	OAUTH_PROVIDER?: OAuthProviderBinding;
+};
+
 type GitHubProfile = {
 	id: number;
 	login: string;
@@ -80,8 +100,8 @@ const readPrimaryEmail = async (accessToken: string): Promise<string | null> => 
 	return primary?.email ?? null;
 };
 
-const handleAuthorizeGet = async (request: Request, env: Env): Promise<Response> => {
-	const authRequest = (await env.OAUTH_PROVIDER.parseAuthRequest(request)) as OAuthRequest;
+const handleAuthorizeGet = async (request: Request, env: EnvWithOAuthProvider): Promise<Response> => {
+	const authRequest = (await env.OAUTH_PROVIDER?.parseAuthRequest(request)) as OAuthRequest;
 	if (!authRequest?.clientId || !authRequest?.redirectUri || !authRequest?.state) {
 		return json(400, {
 			error: "invalid_request",
@@ -102,7 +122,7 @@ const handleAuthorizeGet = async (request: Request, env: Env): Promise<Response>
 	});
 };
 
-const handleAuthorizePost = async (request: Request, env: Env): Promise<Response> => {
+const handleAuthorizePost = async (request: Request, env: EnvWithOAuthProvider): Promise<Response> => {
 	if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
 		return json(500, { error: "server_misconfigured", error_description: "Missing GitHub OAuth secrets." });
 	}
@@ -134,89 +154,106 @@ const handleAuthorizePost = async (request: Request, env: Env): Promise<Response
 	});
 };
 
-const handleCallback = async function (this: any, request: Request, env: Env): Promise<Response> {
+const handleCallback = async (request: Request, env: EnvWithOAuthProvider): Promise<Response> => {
 	const url = new URL(request.url);
 	const code = url.searchParams.get("code");
 	const state = url.searchParams.get("state");
 	const githubError = url.searchParams.get("error");
+	const githubErrorDescription = url.searchParams.get("error_description");
 
-	if (githubError) return json(400, { error: "github_oauth_error", error_description: githubError });
-	if (!code || !state) return json(400, { error: "invalid_request", error_description: "Missing code/state." });
-
-	const cookieState = parseCookie(request.headers.get("cookie"), OAUTH_STATE_COOKIE);
-	if (!cookieState || cookieState !== state) {
-		return json(400, { error: "invalid_state", error_description: "State cookie mismatch." });
-	}
-
-	const pendingKey = `${OAUTH_PENDING_PREFIX}${state}`;
-	const pendingRaw = await env.OAUTH_KV.get(pendingKey);
-	if (!pendingRaw) {
-		return json(400, { error: "expired_state", error_description: "Authorization request expired." });
-	}
-	await env.OAUTH_KV.delete(pendingKey);
-	const { authRequest } = JSON.parse(pendingRaw) as PendingAuthorization;
-
-	const tokenResponse = await fetch(GITHUB_TOKEN_URL, {
-		method: "POST",
-		headers: {
-			Accept: "application/json",
-			"content-type": "application/json",
-			"User-Agent": "remote-mcp-server-authless",
-		},
-		body: JSON.stringify({
-			client_id: env.GITHUB_CLIENT_ID,
-			client_secret: env.GITHUB_CLIENT_SECRET,
-			code,
-			redirect_uri: `${getBaseUrl(request)}/callback`,
-		}),
-	});
-
-	const tokenPayload = (await tokenResponse.json()) as { access_token?: string; error?: string; error_description?: string };
-	if (!tokenResponse.ok || !tokenPayload.access_token) {
+	if (githubError) {
 		return json(400, {
-			error: "token_exchange_failed",
-			error_description: tokenPayload.error_description ?? tokenPayload.error ?? "No GitHub access token.",
+			error: "github_oauth_error",
+			error_description: githubErrorDescription ?? githubError,
 		});
 	}
+	if (!code || !state) return json(400, { error: "invalid_request", error_description: "Missing code/state." });
 
-	const accessToken = tokenPayload.access_token;
-	const userResponse = await fetch(GITHUB_USER_URL, {
-		headers: {
-			Accept: "application/vnd.github+json",
-			Authorization: `Bearer ${accessToken}`,
-			"User-Agent": "remote-mcp-server-authless",
-			"X-GitHub-Api-Version": "2022-11-28",
-		},
-	});
-	if (!userResponse.ok) return json(400, { error: "profile_fetch_failed", error_description: await userResponse.text() });
+	try {
+		if (!env.OAUTH_PROVIDER?.completeAuthorization) {
+			throw new Error("OAUTH_PROVIDER missing");
+		}
 
-	const profile = (await userResponse.json()) as GitHubProfile;
-	const email = profile.email ?? (await readPrimaryEmail(accessToken));
+		const cookieState = parseCookie(request.headers.get("cookie"), OAUTH_STATE_COOKIE);
+		if (!cookieState || cookieState !== state) {
+			return json(400, { error: "invalid_state", error_description: "State cookie mismatch." });
+		}
 
-	const response = await this.completeAuthorization({
-		request,
-		userId: String(profile.id),
-		scope: authRequest.scope,
-		clientId: authRequest.clientId,
-		redirectUri: authRequest.redirectUri,
-		state: authRequest.state,
-		codeChallenge: authRequest.codeChallenge,
-		codeChallengeMethod: authRequest.codeChallengeMethod,
-		nonce: authRequest.nonce,
-		props: {
-			login: profile.login,
-			name: profile.name ?? undefined,
-			email: email ?? undefined,
-			accessToken,
-		},
-	});
+		const pendingKey = `${OAUTH_PENDING_PREFIX}${state}`;
+		const pendingRaw = await env.OAUTH_KV.get(pendingKey);
+		if (!pendingRaw) {
+			return json(400, { error: "expired_state", error_description: "Authorization request expired." });
+		}
+		await env.OAUTH_KV.delete(pendingKey);
+		const { authRequest } = JSON.parse(pendingRaw) as PendingAuthorization;
 
-	response.headers.set("Set-Cookie", clearCookie(OAUTH_STATE_COOKIE));
-	return response;
+		const tokenResponse = await fetch(GITHUB_TOKEN_URL, {
+			method: "POST",
+			headers: {
+				Accept: "application/json",
+				"content-type": "application/json",
+				"User-Agent": "remote-mcp-server-authless",
+			},
+			body: JSON.stringify({
+				client_id: env.GITHUB_CLIENT_ID,
+				client_secret: env.GITHUB_CLIENT_SECRET,
+				code,
+				redirect_uri: `${getBaseUrl(request)}/callback`,
+			}),
+		});
+
+		const tokenPayload = (await tokenResponse.json()) as { access_token?: string; error?: string; error_description?: string };
+		if (!tokenResponse.ok || !tokenPayload.access_token) {
+			return json(400, {
+				error: "token_exchange_failed",
+				error_description: tokenPayload.error_description ?? tokenPayload.error ?? "No GitHub access token.",
+			});
+		}
+
+		const accessToken = tokenPayload.access_token;
+		const userResponse = await fetch(GITHUB_USER_URL, {
+			headers: {
+				Accept: "application/vnd.github+json",
+				Authorization: `Bearer ${accessToken}`,
+				"User-Agent": "remote-mcp-server-authless",
+				"X-GitHub-Api-Version": "2022-11-28",
+			},
+		});
+		if (!userResponse.ok) return json(400, { error: "profile_fetch_failed", error_description: await userResponse.text() });
+
+		const profile = (await userResponse.json()) as GitHubProfile;
+		const email = profile.email ?? (await readPrimaryEmail(accessToken));
+
+		const response = await env.OAUTH_PROVIDER.completeAuthorization({
+			request,
+			userId: String(profile.id),
+			scope: authRequest.scope,
+			clientId: authRequest.clientId,
+			redirectUri: authRequest.redirectUri,
+			state: authRequest.state,
+			codeChallenge: authRequest.codeChallenge,
+			codeChallengeMethod: authRequest.codeChallengeMethod,
+			nonce: authRequest.nonce,
+			props: {
+				login: profile.login,
+				name: profile.name ?? undefined,
+				email: email ?? undefined,
+				accessToken,
+			},
+		});
+
+		response.headers.set("Set-Cookie", clearCookie(OAUTH_STATE_COOKIE));
+		return response;
+	} catch (error) {
+		return json(500, {
+			error: "callback_failed",
+			error_description: error instanceof Error ? error.message : "Unknown callback error",
+		});
+	}
 };
 
 export const GitHubHandler = {
-	async fetch(this: any, request: Request, env: Env): Promise<Response> {
+	async fetch(request: Request, env: EnvWithOAuthProvider, _ctx: ExecutionContext): Promise<Response> {
 		const { pathname } = new URL(request.url);
 
 		if (pathname === "/" || pathname === "/health") {
@@ -232,7 +269,7 @@ export const GitHubHandler = {
 
 		if (pathname === "/authorize" && request.method === "GET") return handleAuthorizeGet(request, env);
 		if (pathname === "/authorize" && request.method === "POST") return handleAuthorizePost(request, env);
-		if (pathname === "/callback" && request.method === "GET") return handleCallback.call(this, request, env);
+		if (pathname === "/callback" && request.method === "GET") return handleCallback(request, env);
 
 		return new Response("Not found", { status: 404 });
 	},
