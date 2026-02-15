@@ -52,6 +52,43 @@ const consentPage = (requestId: string, scope?: string) => `<!doctype html>
 
 const normalizeUsername = (value: string | undefined) => value?.trim().toLowerCase();
 
+type RequestLogContext = {
+	path: string;
+	requestId: string;
+};
+
+const logEvent = (event: string, context: RequestLogContext, extra: Record<string, unknown> = {}) => {
+	console.log(JSON.stringify({ event, ...context, ...extra }));
+};
+
+const logError = (event: string, context: RequestLogContext, error: unknown, extra: Record<string, unknown> = {}) => {
+	console.error(
+		JSON.stringify({
+			event,
+			...context,
+			...extra,
+			error: error instanceof Error ? error.message : String(error),
+		}),
+	);
+};
+
+const withKvTiming = async <T>(
+	context: RequestLogContext,
+	operation: "get" | "put" | "delete",
+	key: string,
+	action: () => Promise<T>,
+): Promise<T> => {
+	const startedAt = Date.now();
+	try {
+		const result = await action();
+		logEvent("oauth_kv_success", context, { operation, key, duration_ms: Date.now() - startedAt });
+		return result;
+	} catch (error) {
+		logError("oauth_kv_failure", context, error, { operation, key, duration_ms: Date.now() - startedAt });
+		throw error;
+	}
+};
+
 const getBaseUrl = (request: Request) => {
 	const url = new URL(request.url);
 	return `${url.protocol}//${url.host}`;
@@ -74,7 +111,7 @@ const readPrimaryEmail = async (accessToken: string): Promise<string | null> => 
 	return primary?.email ?? null;
 };
 
-const handleAuthorizeGet = async (request: Request, env: EnvWithOAuthProvider): Promise<Response> => {
+const handleAuthorizeGet = async (request: Request, env: EnvWithOAuthProvider, context: RequestLogContext): Promise<Response> => {
 	if (!env.OAUTH_PROVIDER?.parseAuthRequest) {
 		return json(500, { error: "server_misconfigured", error_description: "OAuth provider not configured." });
 	}
@@ -95,14 +132,16 @@ const handleAuthorizeGet = async (request: Request, env: EnvWithOAuthProvider): 
 		createdAt: Date.now(),
 	};
 
-	await env.OAUTH_KV.put(`${OAUTH_PENDING_PREFIX}${requestId}`, JSON.stringify(pending), { expirationTtl: 600 });
+	await withKvTiming(context, "put", `${OAUTH_PENDING_PREFIX}${requestId}`, () =>
+		env.OAUTH_KV.put(`${OAUTH_PENDING_PREFIX}${requestId}`, JSON.stringify(pending), { expirationTtl: 600 }),
+	);
 
 	return new Response(consentPage(requestId, oauthReqInfo.scope.join(" ")), {
 		headers: { "content-type": "text/html; charset=utf-8" },
 	});
 };
 
-const handleAuthorizePost = async (request: Request, env: EnvWithOAuthProvider): Promise<Response> => {
+const handleAuthorizePost = async (request: Request, env: EnvWithOAuthProvider, context: RequestLogContext): Promise<Response> => {
 	if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
 		return json(500, { error: "server_misconfigured", error_description: "Missing GitHub OAuth secrets." });
 	}
@@ -113,7 +152,9 @@ const handleAuthorizePost = async (request: Request, env: EnvWithOAuthProvider):
 		return json(400, { error: "invalid_request", error_description: "Missing consent request id." });
 	}
 
-	const pendingRaw = await env.OAUTH_KV.get(`${OAUTH_PENDING_PREFIX}${requestId}`);
+	const pendingRaw = await withKvTiming(context, "get", `${OAUTH_PENDING_PREFIX}${requestId}`, () =>
+		env.OAUTH_KV.get(`${OAUTH_PENDING_PREFIX}${requestId}`),
+	);
 	if (!pendingRaw) {
 		return json(400, { error: "expired_state", error_description: "Authorization request expired." });
 	}
@@ -134,7 +175,7 @@ const handleAuthorizePost = async (request: Request, env: EnvWithOAuthProvider):
 	});
 };
 
-const handleCallback = async (request: Request, env: EnvWithOAuthProvider): Promise<Response> => {
+const handleCallback = async (request: Request, env: EnvWithOAuthProvider, context: RequestLogContext): Promise<Response> => {
 	const url = new URL(request.url);
 	const code = url.searchParams.get("code");
 	const state = url.searchParams.get("state");
@@ -160,11 +201,11 @@ const handleCallback = async (request: Request, env: EnvWithOAuthProvider): Prom
 		}
 
 		const pendingKey = `${OAUTH_PENDING_PREFIX}${state}`;
-		const pendingRaw = await env.OAUTH_KV.get(pendingKey);
+		const pendingRaw = await withKvTiming(context, "get", pendingKey, () => env.OAUTH_KV.get(pendingKey));
 		if (!pendingRaw) {
 			return json(400, { error: "expired_state", error_description: "Authorization request expired." });
 		}
-		await env.OAUTH_KV.delete(pendingKey);
+		await withKvTiming(context, "delete", pendingKey, () => env.OAUTH_KV.delete(pendingKey));
 		const { authRequest } = JSON.parse(pendingRaw) as PendingAuthorization;
 
 		const tokenResponse = await fetch(GITHUB_TOKEN_URL, {
@@ -204,6 +245,7 @@ const handleCallback = async (request: Request, env: EnvWithOAuthProvider): Prom
 		const profile = (await userResponse.json()) as GitHubProfile;
 		const email = profile.email ?? (await readPrimaryEmail(accessToken));
 
+		const completeAuthorizationStartedAt = Date.now();
 		const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
 			request: authRequest,
 			userId: profile.login || String(profile.id),
@@ -216,6 +258,10 @@ const handleCallback = async (request: Request, env: EnvWithOAuthProvider): Prom
 				accessToken,
 			},
 		});
+		logEvent("oauth_complete_authorization_success", context, {
+			duration_ms: Date.now() - completeAuthorizationStartedAt,
+			login_present: Boolean(profile.login),
+		});
 
 		return new Response(null, {
 			status: 302,
@@ -226,6 +272,7 @@ const handleCallback = async (request: Request, env: EnvWithOAuthProvider): Prom
 			},
 		});
 	} catch (error) {
+		logError("oauth_callback_failed", context, error);
 		return json(400, {
 			error: "callback_failed",
 			error_description: error instanceof Error ? error.message : "Unknown callback error",
@@ -236,6 +283,9 @@ const handleCallback = async (request: Request, env: EnvWithOAuthProvider): Prom
 export const GitHubHandler = {
 	async fetch(request: Request, env: EnvWithOAuthProvider, _ctx: ExecutionContext): Promise<Response> {
 		const { pathname } = new URL(request.url);
+		const requestId = request.headers.get("cf-ray") ?? crypto.randomUUID();
+		const context: RequestLogContext = { path: pathname, requestId };
+		logEvent("oauth_request", context, { method: request.method });
 
 		if (pathname === "/" || pathname === "/health") {
 			return Response.json({
@@ -248,9 +298,9 @@ export const GitHubHandler = {
 			});
 		}
 
-		if (pathname === "/authorize" && request.method === "GET") return handleAuthorizeGet(request, env);
-		if (pathname === "/authorize" && request.method === "POST") return handleAuthorizePost(request, env);
-		if (pathname === "/callback" && request.method === "GET") return handleCallback(request, env);
+		if (pathname === "/authorize" && request.method === "GET") return handleAuthorizeGet(request, env, context);
+		if (pathname === "/authorize" && request.method === "POST") return handleAuthorizePost(request, env, context);
+		if (pathname === "/callback" && request.method === "GET") return handleCallback(request, env, context);
 
 		return new Response("Not found", { status: 404 });
 	},
