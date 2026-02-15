@@ -5,6 +5,10 @@ declare namespace Cloudflare {
 		OAUTH_KV: KVNamespace;
 		MCP_OBJECT: DurableObjectNamespace<import("./src/index").MyMCP>;
 		ASSETS: Fetcher;
+		ALLOWED_GITHUB_USERNAME: string;
+		GITHUB_CLIENT_ID: string;
+		GITHUB_CLIENT_SECRET: string;
+		YNAB_ACCESS_TOKEN: string;
 	}
 }
 interface Env extends Cloudflare.Env {}
