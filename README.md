@@ -2,6 +2,8 @@
 
 This Worker is now configured as an **OAuth-protected remote MCP server** using the Cloudflare Workers OAuth provider pattern, with **read-only YNAB tools**.
 
+Only the GitHub username configured in `ALLOWED_GITHUB_USERNAME` can load YNAB tools; all other users get a safe `whoami` response and no budget/account/transaction/category tools are registered.
+
 ## What this server exposes
 
 - `ynab_list_budgets`
@@ -48,7 +50,7 @@ Only this GitHub user can access YNAB tools.
 
 Create/update a GitHub OAuth App and set:
 
-- **Authorization callback URL**: `https://<your-worker-domain>/authorize`
+- **Authorization callback URL**: `https://<your-worker-domain>/callback`
 - Homepage URL: `https://<your-worker-domain>/`
 
 Example Worker domain:
