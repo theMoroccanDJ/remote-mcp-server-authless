@@ -26,10 +26,10 @@ export class MyMCP extends McpAgent<EnvWithConfig, Props> {
 	server = new McpServer({ name: "ynab-mcp", version: "1.0.0" });
 
 	async init() {
-		const allowedUsername = this.env.ALLOWED_GITHUB_USERNAME;
-		const login = this.props?.login;
+		const allowedUsername = this.env.ALLOWED_GITHUB_USERNAME?.trim().toLowerCase();
+		const login = this.props?.login?.trim().toLowerCase();
 
-		if (!login || login !== allowedUsername) {
+		if (!login || !allowedUsername || login !== allowedUsername) {
 			this.server.tool(
 				"whoami",
 				"Shows the authenticated GitHub username and current allowlist status.",
