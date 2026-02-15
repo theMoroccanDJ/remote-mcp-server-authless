@@ -1,5 +1,6 @@
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { McpAgent } from "agents/mcp";
 import { z } from "zod";
 import { GitHubHandler } from "./github-handler";
@@ -22,18 +23,85 @@ type EnvWithConfig = Env & {
 
 const YNAB_BASE = "https://api.ynab.com/v1";
 
-export class MyMCP extends McpAgent<EnvWithConfig, Props> {
+type RequestLogContext = {
+	path: string;
+	requestId: string;
+};
+
+const logInfo = (event: string, context: RequestLogContext, extra: Record<string, unknown> = {}) => {
+	console.log(JSON.stringify({ event, ...context, ...extra }));
+};
+
+export class MyMCP extends McpAgent<EnvWithConfig, unknown, Props> {
 	server = new McpServer({ name: "ynab-mcp", version: "1.0.0" });
+
+	async setInitializeRequest(initializeRequest: JSONRPCMessage): Promise<void> {
+		const startedAt = Date.now();
+		await super.setInitializeRequest(initializeRequest);
+		console.log(
+			JSON.stringify({
+				event: "mcp_initialize_request_set",
+				session: this.name,
+				duration_ms: Date.now() - startedAt,
+			}),
+		);
+	}
+
+	async getInitializeRequest(): Promise<JSONRPCMessage | undefined> {
+		const startedAt = Date.now();
+		const initializeRequest = await super.getInitializeRequest();
+		console.log(
+			JSON.stringify({
+				event: "mcp_initialize_request_get",
+				session: this.name,
+				found: Boolean(initializeRequest),
+				duration_ms: Date.now() - startedAt,
+			}),
+		);
+		return initializeRequest;
+	}
+
+	async updateProps(props?: Props): Promise<void> {
+		const startedAt = Date.now();
+		await super.updateProps(props);
+		console.log(
+			JSON.stringify({
+				event: "mcp_props_updated",
+				session: this.name,
+				login_present: Boolean(props?.login),
+				duration_ms: Date.now() - startedAt,
+			}),
+		);
+	}
 
 	async init() {
 		const allowedUsername = this.env.ALLOWED_GITHUB_USERNAME?.trim().toLowerCase();
 		const login = this.props?.login?.trim().toLowerCase();
+		const allowlistMatched = Boolean(allowedUsername && login && login === allowedUsername);
+
+		this.server.tool(
+			"debug_auth_status",
+			"Debug authentication/session status without exposing secrets.",
+			{},
+			async () => ({
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify({
+							props_login_exists: Boolean(login),
+							allowlist_matched: allowlistMatched,
+							ynab_token_env_exists: Boolean(this.env.YNAB_ACCESS_TOKEN),
+						}),
+					},
+				],
+			}),
+		);
 
 		if (!allowedUsername) {
 			throw new Error("Missing ALLOWED_GITHUB_USERNAME Cloudflare secret.");
 		}
 
-		if (!login || login !== allowedUsername) {
+		if (!allowlistMatched) {
 			this.server.tool(
 				"whoami",
 				"Shows the authenticated GitHub username and current allowlist status.",
@@ -195,12 +263,25 @@ const getProtectedResourceMetadata = (request: Request) => {
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
+		const requestId = request.headers.get("cf-ray") ?? crypto.randomUUID();
+		const context: RequestLogContext = { path: url.pathname, requestId };
+		const startedAt = Date.now();
+		logInfo("request_start", context, { method: request.method });
 
 		if (url.pathname === "/.well-known/oauth-protected-resource" && request.method === "GET") {
 			return Response.json(getProtectedResourceMetadata(request));
 		}
 
-		const response = await oauthProvider.fetch(request, env, ctx);
+		if (!oauthProvider.fetch) {
+			throw new Error("OAuth provider fetch handler is not configured.");
+		}
+
+		const response = await oauthProvider.fetch(request as any, env, ctx);
+		logInfo("request_complete", context, {
+			method: request.method,
+			status: response.status,
+			duration_ms: Date.now() - startedAt,
+		});
 
 		if (url.pathname === "/mcp" && response.status === 401) {
 			const headers = new Headers(response.headers);
