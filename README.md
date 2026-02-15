@@ -1,34 +1,32 @@
 # GitHub OAuth + YNAB Remote MCP on Cloudflare Workers
 
-This Worker is now configured as an **OAuth-protected remote MCP server** using the Cloudflare Workers OAuth provider pattern, with **read-only YNAB tools**.
+This Worker is configured as an **OAuth-protected remote MCP server** using Cloudflare Workers OAuth provider endpoints.
 
-Only the GitHub username configured in `ALLOWED_GITHUB_USERNAME` can load YNAB tools; all other users get a safe `whoami` response and no budget/account/transaction/category tools are registered.
+## Deployed URLs
 
-## What this server exposes
+- Homepage URL: `https://remote-mcp-server-authless.dj8gbxbrpp.workers.dev/`
+- GitHub OAuth callback URL: `https://remote-mcp-server-authless.dj8gbxbrpp.workers.dev/callback`
+- ChatGPT MCP server URL: `https://remote-mcp-server-authless.dj8gbxbrpp.workers.dev/mcp`
 
-- `ynab_list_budgets`
-- `ynab_list_accounts`
-- `ynab_list_transactions` (supports `since_date`)
-- `ynab_get_month_categories`
+## OAuth flow used by ChatGPT
 
-Access is restricted by GitHub login allowlist (`ALLOWED_GITHUB_USERNAME`).
+ChatGPT connects to the MCP endpoint (`/mcp`) and performs OAuth against Worker-managed endpoints:
 
----
+- `/authorize`
+- `/token`
+- `/register`
 
-## 1) Configure Cloudflare resources
+`/authorize` starts consent and redirects to GitHub, then GitHub returns to `/callback`, and the Worker completes OAuth through Cloudflare's OAuth provider.
 
-### Create KV namespace for OAuth state
+> Do **not** paste your GitHub client secret into ChatGPT. Keep `GITHUB_CLIENT_SECRET` only in Worker secrets.
 
-```bash
-npx wrangler kv namespace create OAUTH_KV
-npx wrangler kv namespace create OAUTH_KV --preview
-```
+## Existing KV binding
 
-Set `kv_namespaces[0].id` in `wrangler.jsonc` to your created namespace ID.
+Keep the configured binding in `wrangler.jsonc`:
 
-> For local `wrangler dev`, you can additionally set `preview_id` if you use a dedicated preview KV namespace.
+- `OAUTH_KV` id: `c1e3f3dc71a740beb172fac97ff7e982`
 
-### Set required secrets
+## Setup reminders
 
 ```bash
 npx wrangler secret put GITHUB_CLIENT_ID
@@ -36,55 +34,19 @@ npx wrangler secret put GITHUB_CLIENT_SECRET
 npx wrangler secret put YNAB_ACCESS_TOKEN
 ```
 
-### Set required environment variable (allowlist)
-
-Set this in Cloudflare Worker settings (or with Wrangler env vars):
+Set allowlist username:
 
 - `ALLOWED_GITHUB_USERNAME=<your-github-username>`
 
-Only this GitHub user can access YNAB tools.
-
----
-
-## 2) GitHub OAuth app setup
-
-Create/update a GitHub OAuth App and set:
-
-- **Authorization callback URL**: `https://<your-worker-domain>/callback`
-- Homepage URL: `https://<your-worker-domain>/`
-
-Example Worker domain:
-
-- `https://remote-mcp-server-authless.<account>.workers.dev`
-
----
-
-## 3) Deploy
+## Deploy
 
 ```bash
 npm install
 npm run deploy
 ```
 
----
+## Smoke test checklist
 
-## 4) MCP endpoint for ChatGPT
-
-Use this MCP server URL in ChatGPT:
-
-- `https://<your-worker-domain>/sse`
-
-OAuth endpoints used by the provider:
-
-- `/authorize`
-- `/token`
-- `/register`
-
----
-
-## Local development
-
-```bash
-npm run dev
-npm run type-check
-```
+1. Visit `/authorize` with OAuth query parameters and verify consent page renders.
+2. Click continue, authenticate on GitHub, and verify redirect to `/callback` completes authorization.
+3. Connect ChatGPT to `/mcp`, finish OAuth, and confirm MCP tools are visible.

@@ -1,9 +1,27 @@
+import { clearCookie, json, parseCookie, randomHex, setCookie } from "./utils";
+
 const GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize";
 const GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token";
 const GITHUB_USER_URL = "https://api.github.com/user";
 const GITHUB_EMAILS_URL = "https://api.github.com/user/emails";
+const OAUTH_STATE_COOKIE = "oauth_request_state";
+const OAUTH_PENDING_PREFIX = "oauth:pending:";
 
-const encoder = new TextEncoder();
+type OAuthRequest = {
+	clientId?: string;
+	redirectUri?: string;
+	responseType?: string;
+	state?: string;
+	scope?: string;
+	codeChallenge?: string;
+	codeChallengeMethod?: string;
+	nonce?: string;
+};
+
+type PendingAuthorization = {
+	authRequest: OAuthRequest;
+	createdAt: number;
+};
 
 type GitHubProfile = {
 	id: number;
@@ -12,39 +30,38 @@ type GitHubProfile = {
 	email: string | null;
 };
 
-type AuthorizationState = {
-	requestedState: string;
-	requestedScope: string;
-	redirectUri: string;
-	clientId: string;
-	codeChallenge?: string;
-	codeChallengeMethod?: string;
-	nonce?: string;
-	createdAt: number;
-};
+const consentPage = (requestId: string, scope?: string) => `<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>Authorize ChatGPT</title>
+	<style>
+		body { font-family: system-ui, sans-serif; max-width: 640px; margin: 3rem auto; padding: 0 1rem; }
+		.card { border: 1px solid #ddd; border-radius: 12px; padding: 1rem 1.25rem; }
+		button { margin-top: 1rem; background: #111; color: #fff; border: 0; border-radius: 8px; padding: .6rem .9rem; cursor: pointer; }
+		code { background: #f4f4f5; padding: .15rem .35rem; border-radius: .35rem; }
+	</style>
+</head>
+<body>
+	<div class="card">
+		<h1>Authorize ChatGPT</h1>
+		<p>Continue with GitHub to authorize this MCP server.</p>
+		<p>Requested scope: <code>${scope || "(none)"}</code></p>
+		<form method="post" action="/authorize">
+			<input type="hidden" name="request_id" value="${requestId}" />
+			<button type="submit">Continue with GitHub</button>
+		</form>
+	</div>
+</body>
+</html>`;
 
-const json = (status: number, body: unknown) =>
-	new Response(JSON.stringify(body), {
-		status,
-		headers: { "content-type": "application/json; charset=utf-8" },
-	});
-
-const randomString = (bytes = 16) => {
-	const data = crypto.getRandomValues(new Uint8Array(bytes));
-	return [...data].map((value) => value.toString(16).padStart(2, "0")).join("");
-};
-
-const sha256 = async (value: string) => {
-	const digest = await crypto.subtle.digest("SHA-256", encoder.encode(value));
-	return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-};
+const normalizeUsername = (value: string | undefined) => value?.trim().toLowerCase();
 
 const getBaseUrl = (request: Request) => {
 	const url = new URL(request.url);
 	return `${url.protocol}//${url.host}`;
 };
-
-const normalizeUsername = (value: string | undefined) => value?.trim().toLowerCase();
 
 const readPrimaryEmail = async (accessToken: string): Promise<string | null> => {
 	const response = await fetch(GITHUB_EMAILS_URL, {
@@ -56,84 +73,88 @@ const readPrimaryEmail = async (accessToken: string): Promise<string | null> => 
 		},
 	});
 
-	if (!response.ok) {
-		return null;
-	}
+	if (!response.ok) return null;
 
 	const emails = (await response.json()) as Array<{ email: string; primary: boolean; verified: boolean }>;
 	const primary = emails.find((item) => item.primary && item.verified) ?? emails.find((item) => item.verified);
 	return primary?.email ?? null;
 };
 
-async function handleAuthorize(request: Request, env: Env): Promise<Response> {
+const handleAuthorizeGet = async (request: Request, env: Env): Promise<Response> => {
+	const authRequest = (await env.OAUTH_PROVIDER.parseAuthRequest(request)) as OAuthRequest;
+	if (!authRequest?.clientId || !authRequest?.redirectUri || !authRequest?.state) {
+		return json(400, {
+			error: "invalid_request",
+			error_description: "Missing OAuth client_id, redirect_uri, or state.",
+		});
+	}
+
+	const requestId = randomHex(24);
+	const pending: PendingAuthorization = {
+		authRequest,
+		createdAt: Date.now(),
+	};
+
+	await env.OAUTH_KV.put(`${OAUTH_PENDING_PREFIX}${requestId}`, JSON.stringify(pending), { expirationTtl: 600 });
+
+	return new Response(consentPage(requestId, authRequest.scope), {
+		headers: { "content-type": "text/html; charset=utf-8" },
+	});
+};
+
+const handleAuthorizePost = async (request: Request, env: Env): Promise<Response> => {
 	if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
 		return json(500, { error: "server_misconfigured", error_description: "Missing GitHub OAuth secrets." });
 	}
 
-	const url = new URL(request.url);
-	const requestedState = url.searchParams.get("state") ?? randomString(12);
-	const requestedScope = url.searchParams.get("scope") ?? "";
-	const redirectUri = url.searchParams.get("redirect_uri") ?? "";
-	const clientId = url.searchParams.get("client_id") ?? "";
-	const codeChallenge = url.searchParams.get("code_challenge") ?? undefined;
-	const codeChallengeMethod = url.searchParams.get("code_challenge_method") ?? undefined;
-	const nonce = url.searchParams.get("nonce") ?? undefined;
+	const formData = await request.formData();
+	const requestId = String(formData.get("request_id") ?? "");
+	if (!requestId) {
+		return json(400, { error: "invalid_request", error_description: "Missing consent request id." });
+	}
 
-	const relayState = randomString(24);
-	const statePayload: AuthorizationState = {
-		requestedState,
-		requestedScope,
-		redirectUri,
-		clientId,
-		codeChallenge,
-		codeChallengeMethod,
-		nonce,
-		createdAt: Date.now(),
-	};
+	const pendingRaw = await env.OAUTH_KV.get(`${OAUTH_PENDING_PREFIX}${requestId}`);
+	if (!pendingRaw) {
+		return json(400, { error: "expired_state", error_description: "Authorization request expired." });
+	}
 
-	await env.OAUTH_KV.put(`oauth:state:${relayState}`, JSON.stringify(statePayload), { expirationTtl: 600 });
-
-	const githubState = `${relayState}.${await sha256(`${relayState}:${env.GITHUB_CLIENT_ID}`)}`;
 	const githubAuthorize = new URL(GITHUB_AUTHORIZE_URL);
 	githubAuthorize.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
 	githubAuthorize.searchParams.set("redirect_uri", `${getBaseUrl(request)}/callback`);
 	githubAuthorize.searchParams.set("scope", "read:user user:email");
-	githubAuthorize.searchParams.set("state", githubState);
+	githubAuthorize.searchParams.set("state", requestId);
 
-	return Response.redirect(githubAuthorize.toString(), 302);
-}
+	return new Response(null, {
+		status: 302,
+		headers: {
+			Location: githubAuthorize.toString(),
+			"Set-Cookie": setCookie(OAUTH_STATE_COOKIE, requestId, 600),
+			"Cache-Control": "no-store",
+		},
+	});
+};
 
-async function handleCallback(this: any, request: Request, env: Env): Promise<Response> {
+const handleCallback = async function (this: any, request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	const code = url.searchParams.get("code");
 	const state = url.searchParams.get("state");
 	const githubError = url.searchParams.get("error");
 
-	if (githubError) {
-		return json(400, { error: "github_oauth_error", error_description: githubError });
+	if (githubError) return json(400, { error: "github_oauth_error", error_description: githubError });
+	if (!code || !state) return json(400, { error: "invalid_request", error_description: "Missing code/state." });
+
+	const cookieState = parseCookie(request.headers.get("cookie"), OAUTH_STATE_COOKIE);
+	if (!cookieState || cookieState !== state) {
+		return json(400, { error: "invalid_state", error_description: "State cookie mismatch." });
 	}
 
-	if (!code || !state) {
-		return json(400, { error: "invalid_request", error_description: "Missing GitHub code/state." });
+	const pendingKey = `${OAUTH_PENDING_PREFIX}${state}`;
+	const pendingRaw = await env.OAUTH_KV.get(pendingKey);
+	if (!pendingRaw) {
+		return json(400, { error: "expired_state", error_description: "Authorization request expired." });
 	}
-
-	const [relayState, stateSignature] = state.split(".");
-	if (!relayState || !stateSignature) {
-		return json(400, { error: "invalid_state" });
-	}
-
-	const expectedSignature = await sha256(`${relayState}:${env.GITHUB_CLIENT_ID}`);
-	if (expectedSignature !== stateSignature) {
-		return json(400, { error: "invalid_state_signature" });
-	}
-
-	const stateRecord = await env.OAUTH_KV.get(`oauth:state:${relayState}`, "json");
-	if (!stateRecord) {
-		return json(400, { error: "expired_state" });
-	}
-	await env.OAUTH_KV.delete(`oauth:state:${relayState}`);
-
-	const authState = stateRecord as AuthorizationState;
+	await env.OAUTH_KV.delete(pendingKey);
+	const { authRequest } = JSON.parse(pendingRaw) as PendingAuthorization;
 
 	const tokenResponse = await fetch(GITHUB_TOKEN_URL, {
 		method: "POST",
@@ -154,7 +175,7 @@ async function handleCallback(this: any, request: Request, env: Env): Promise<Re
 	if (!tokenResponse.ok || !tokenPayload.access_token) {
 		return json(400, {
 			error: "token_exchange_failed",
-			error_description: tokenPayload.error_description ?? tokenPayload.error ?? "GitHub did not return an access token.",
+			error_description: tokenPayload.error_description ?? tokenPayload.error ?? "No GitHub access token.",
 		});
 	}
 
@@ -167,42 +188,21 @@ async function handleCallback(this: any, request: Request, env: Env): Promise<Re
 			"X-GitHub-Api-Version": "2022-11-28",
 		},
 	});
-	if (!userResponse.ok) {
-		return json(400, { error: "profile_fetch_failed", error_description: await userResponse.text() });
-	}
+	if (!userResponse.ok) return json(400, { error: "profile_fetch_failed", error_description: await userResponse.text() });
 
 	const profile = (await userResponse.json()) as GitHubProfile;
 	const email = profile.email ?? (await readPrimaryEmail(accessToken));
 
-	await env.OAUTH_KV.put(
-		`oauth:user:${profile.id}`,
-		JSON.stringify({
-			id: profile.id,
-			login: profile.login,
-			name: profile.name,
-			email,
-			issuedAt: Date.now(),
-		}),
-		{ expirationTtl: 86400 },
-	);
-
-	if (typeof this?.completeAuthorization !== "function") {
-		return json(500, {
-			error: "oauth_provider_misconfigured",
-			error_description: "OAuthProvider completion method is unavailable.",
-		});
-	}
-
-	return this.completeAuthorization({
+	const response = await this.completeAuthorization({
 		request,
 		userId: String(profile.id),
-		scope: authState.requestedScope,
-		clientId: authState.clientId,
-		redirectUri: authState.redirectUri,
-		state: authState.requestedState,
-		codeChallenge: authState.codeChallenge,
-		codeChallengeMethod: authState.codeChallengeMethod,
-		nonce: authState.nonce,
+		scope: authRequest.scope,
+		clientId: authRequest.clientId,
+		redirectUri: authRequest.redirectUri,
+		state: authRequest.state,
+		codeChallenge: authRequest.codeChallenge,
+		codeChallengeMethod: authRequest.codeChallengeMethod,
+		nonce: authRequest.nonce,
 		props: {
 			login: profile.login,
 			name: profile.name ?? undefined,
@@ -210,7 +210,10 @@ async function handleCallback(this: any, request: Request, env: Env): Promise<Re
 			accessToken,
 		},
 	});
-}
+
+	response.headers.set("Set-Cookie", clearCookie(OAUTH_STATE_COOKIE));
+	return response;
+};
 
 export const GitHubHandler = {
 	async fetch(this: any, request: Request, env: Env): Promise<Response> {
@@ -220,30 +223,18 @@ export const GitHubHandler = {
 			return Response.json({
 				ok: true,
 				auth: "github-oauth",
-				mcp_sse: "/sse",
+				mcp: "/mcp",
 				authorize: "/authorize",
 				token: "/token",
 				register: "/register",
 			});
 		}
 
-		if (pathname === "/authorize") {
-			return handleAuthorize(request, env);
-		}
-
-		if (pathname === "/callback") {
-			return handleCallback.call(this, request, env);
-		}
+		if (pathname === "/authorize" && request.method === "GET") return handleAuthorizeGet(request, env);
+		if (pathname === "/authorize" && request.method === "POST") return handleAuthorizePost(request, env);
+		if (pathname === "/callback" && request.method === "GET") return handleCallback.call(this, request, env);
 
 		return new Response("Not found", { status: 404 });
-	},
-
-	async authorize(this: any, request: Request, env: Env): Promise<Response> {
-		return handleAuthorize(request, env);
-	},
-
-	async callback(this: any, request: Request, env: Env): Promise<Response> {
-		return handleCallback.call(this, request, env);
 	},
 
 	isAuthorized(this: any, params: { props?: { login?: string } }, env: Env): boolean {
