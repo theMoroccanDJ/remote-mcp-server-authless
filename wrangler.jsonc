@@ -25,4 +25,11 @@
 	"observability": {
 		"enabled": true
 	}
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "c1e3f3dc71a740beb172fac97ff7e982",
+      
+      // Optional: preview_id used when running `wrangler dev` for local dev
+      "preview_id": "<ID_OF_PREVIEW_KV_NAMESPACE_FOR_LOCAL_DEVELOPMENT>"
 }
