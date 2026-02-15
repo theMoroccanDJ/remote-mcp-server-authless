@@ -1,3 +1,4 @@
+import type { AuthRequest, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { clearCookie, json, parseCookie, randomHex, setCookie } from "./utils";
 
 const GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize";
@@ -7,40 +8,13 @@ const GITHUB_EMAILS_URL = "https://api.github.com/user/emails";
 const OAUTH_STATE_COOKIE = "oauth_request_state";
 const OAUTH_PENDING_PREFIX = "oauth:pending:";
 
-type OAuthRequest = {
-	clientId?: string;
-	redirectUri?: string;
-	responseType?: string;
-	state?: string;
-	scope?: string;
-	codeChallenge?: string;
-	codeChallengeMethod?: string;
-	nonce?: string;
-};
-
 type PendingAuthorization = {
-	authRequest: OAuthRequest;
+	authRequest: AuthRequest;
 	createdAt: number;
 };
 
-type OAuthProviderBinding = {
-	parseAuthRequest: (request: Request) => Promise<unknown>;
-	completeAuthorization: (params: {
-		request: Request;
-		userId: string;
-		scope?: string;
-		clientId?: string;
-		redirectUri?: string;
-		state?: string;
-		codeChallenge?: string;
-		codeChallengeMethod?: string;
-		nonce?: string;
-		props?: Record<string, unknown>;
-	}) => Promise<Response>;
-};
-
 type EnvWithOAuthProvider = Env & {
-	OAUTH_PROVIDER?: OAuthProviderBinding;
+	OAUTH_PROVIDER?: OAuthHelpers;
 };
 
 type GitHubProfile = {
@@ -101,23 +75,29 @@ const readPrimaryEmail = async (accessToken: string): Promise<string | null> => 
 };
 
 const handleAuthorizeGet = async (request: Request, env: EnvWithOAuthProvider): Promise<Response> => {
-	const authRequest = (await env.OAUTH_PROVIDER?.parseAuthRequest(request)) as OAuthRequest;
-	if (!authRequest?.clientId || !authRequest?.redirectUri || !authRequest?.state) {
+	if (!env.OAUTH_PROVIDER?.parseAuthRequest) {
+		return json(500, { error: "server_misconfigured", error_description: "OAuth provider not configured." });
+	}
+
+	let oauthReqInfo: AuthRequest;
+	try {
+		oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+	} catch {
 		return json(400, {
 			error: "invalid_request",
-			error_description: "Missing OAuth client_id, redirect_uri, or state.",
+			error_description: "Client ID and Redirect URI are required in the authorization request.",
 		});
 	}
 
 	const requestId = randomHex(24);
 	const pending: PendingAuthorization = {
-		authRequest,
+		authRequest: oauthReqInfo,
 		createdAt: Date.now(),
 	};
 
 	await env.OAUTH_KV.put(`${OAUTH_PENDING_PREFIX}${requestId}`, JSON.stringify(pending), { expirationTtl: 600 });
 
-	return new Response(consentPage(requestId, authRequest.scope), {
+	return new Response(consentPage(requestId, oauthReqInfo.scope.join(" ")), {
 		headers: { "content-type": "text/html; charset=utf-8" },
 	});
 };
@@ -171,7 +151,7 @@ const handleCallback = async (request: Request, env: EnvWithOAuthProvider): Prom
 
 	try {
 		if (!env.OAUTH_PROVIDER?.completeAuthorization) {
-			throw new Error("OAUTH_PROVIDER missing");
+			return json(500, { error: "server_misconfigured", error_description: "OAuth provider not configured." });
 		}
 
 		const cookieState = parseCookie(request.headers.get("cookie"), OAUTH_STATE_COOKIE);
@@ -224,16 +204,11 @@ const handleCallback = async (request: Request, env: EnvWithOAuthProvider): Prom
 		const profile = (await userResponse.json()) as GitHubProfile;
 		const email = profile.email ?? (await readPrimaryEmail(accessToken));
 
-		const response = await env.OAUTH_PROVIDER.completeAuthorization({
-			request,
-			userId: String(profile.id),
+		const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+			request: authRequest,
+			userId: profile.login || String(profile.id),
 			scope: authRequest.scope,
-			clientId: authRequest.clientId,
-			redirectUri: authRequest.redirectUri,
-			state: authRequest.state,
-			codeChallenge: authRequest.codeChallenge,
-			codeChallengeMethod: authRequest.codeChallengeMethod,
-			nonce: authRequest.nonce,
+			metadata: {},
 			props: {
 				login: profile.login,
 				name: profile.name ?? undefined,
@@ -242,10 +217,16 @@ const handleCallback = async (request: Request, env: EnvWithOAuthProvider): Prom
 			},
 		});
 
-		response.headers.set("Set-Cookie", clearCookie(OAUTH_STATE_COOKIE));
-		return response;
+		return new Response(null, {
+			status: 302,
+			headers: {
+				Location: redirectTo,
+				"Set-Cookie": clearCookie(OAUTH_STATE_COOKIE),
+				"Cache-Control": "no-store",
+			},
+		});
 	} catch (error) {
-		return json(500, {
+		return json(400, {
 			error: "callback_failed",
 			error_description: error instanceof Error ? error.message : "Unknown callback error",
 		});
